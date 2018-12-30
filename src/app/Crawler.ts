@@ -1,19 +1,18 @@
-import { RequestPromiseOptions } from 'request-promise';
-import { ICrawlerOptions }  from './ICrawlerOptions';
+import { RequestPromiseOptions } from 'request-promise-native';
+import { ICrawlerOptions }  from '@app/ICrawlerOptions';
+import ICrawlerResult from '@app/ICrawlerResult';
+
+import * as chr from 'cheerio';
 
 const rp = require('request-promise-native');
 const cheerio = require('cheerio');
-
-const fs = require('fs');
-
-import * as chr from 'cheerio';
 
 export default class Crawler {
   /**
    * Set of urls to be visited.
    * Unique urls only
    */
-  public queue: Set<string>;
+  private queue: Set<string>;
 
   private isActive: boolean;
   private readonly baseUrl: string;
@@ -24,9 +23,7 @@ export default class Crawler {
     transform: (body: string) => cheerio.load(body),
   };
 
-  private selector = 'ul > li > article > a';
-
-  private options: ICrawlerOptions = {};
+  private options: ICrawlerOptions;
 
   /**
    *
@@ -36,9 +33,14 @@ export default class Crawler {
    * Default 1000
    */
   constructor(baseUrl: string, options: ICrawlerOptions = {
+    linkSelectors: [],
+    fnLinks: () => {},
+
+    contentSelectors: [],
+    fnContent: () => {},
+
     timeBetweenRequests: 1000,
     workers: 10,
-    fileOutputPath: '',
     ignoreExternal: false,
   }) {
     this.baseUrl = baseUrl;
@@ -48,14 +50,19 @@ export default class Crawler {
     this.visitedCount = 0;
 
     this.options = options;
-
-    if (this.options.debug) {
-      console.info(`Time between requests set to ${this.options.timeBetweenRequests}`);
+    // options validation
+    if (!this.options.linkSelectors.length) {
+      throw new Error('link selectors option missing');
     }
+
+    this.printDebug(`Time between requests set to ${this.options.timeBetweenRequests}`);
 
     this.isActive = false;
   }
 
+  /**
+   * Returns and removes the first element of the queue
+   */
   public getFromQueue(): string {
     const tempArr = Array.from(this.queue);
     const firstUrl = tempArr.shift() as string;
@@ -65,6 +72,10 @@ export default class Crawler {
     return firstUrl;
   }
 
+  /**
+   * Adds a link or array of links to the end of the queue
+   * @param url
+   */
   public addToQueue(url: string | string[]) {
     if (!url) {
       return;
@@ -83,19 +94,7 @@ export default class Crawler {
         newUrl = this.baseUrl + url;
       }
 
-      if (!this.queue.has(url)) {
-        this.queue.add(newUrl);
-
-        if (!this.options.fileOutputPath) {
-          return;
-        }
-
-        fs.appendFile(this.options.fileOutputPath, url, (err: Error) => {
-          if (err) {
-            return console.error(err);
-          }
-        });
-      }
+      this.queue.add(newUrl);
     } else {
       url.forEach((u) => {
         if (this.options.ignoreExternal) {
@@ -104,25 +103,13 @@ export default class Crawler {
           }
         }
 
-        let url = u;
+        let newUrl = u;
 
-        if (!url.includes(this.baseUrl)) {
-          url = this.baseUrl + u;
+        if (!newUrl.includes(this.baseUrl)) {
+          newUrl = this.baseUrl + u;
         }
 
-        if (!this.queue.has(url)) {
-          this.queue.add(url);
-
-          if (!this.options.fileOutputPath) {
-            return;
-          }
-
-          fs.appendFile(this.options.fileOutputPath, `${url}\n`, (err: Error) => {
-            if (err) {
-              return console.error(err);
-            }
-          });
-        }
+        this.queue.add(newUrl);
       });
     }
   }
@@ -138,43 +125,35 @@ export default class Crawler {
   }
 
   private work(): void {
-    if (this.options.debug) {
-      console.info(`On queue ${this.queue.size}` +
-      ` :: Visited ${this.visitedCount}` +
-      ` :: Diff ${this.queue.size - this.visitedCount}`);
-    }
-
     for (let workerId = 0; workerId < (this.options.workers as number); workerId += 1) {
-      const url = this.getFromQueue();
+      this.startWorker();
+    }
+  }
 
-      if (!url) {
-        console.warn('Queue empty');
+  private startWorker(): void {
+    this.printDebug(`On queue ${this.queue.size} :: Visited ${this.visitedCount}`);
 
-        setTimeout(() => {
-          if (this.isActive) {
-            this.work();
-          }
-        },         this.options.timeBetweenRequests);
-        return;
-      }
+    const url = this.getFromQueue();
 
+    if (url) {
       this.crawl(url)
-        .then(links => this.addToQueue(links))
-        .catch(err => this.addToQueue(url));
+        .then((results: {
+          linkSelection: ICrawlerResult[];
+          contentSelection: ICrawlerResult[];
+        }) => {
+          this.options.fnLinks(results.linkSelection);
+          this.options.fnContent(results.contentSelection);
+        });
     }
 
-    setTimeout(() => {
-      if (this.isActive) {
-        this.work();
-      }
-    },         this.options.timeBetweenRequests);
+    setTimeout(() => this.startWorker(), this.options.timeBetweenRequests);
   }
 
   /**
-   * On resolve returns array of crawled urls
+   * On resolve returns array of crawled {@link CheerioElement}
    * @param url To be crawled from
    */
-  private crawl(url: string): Promise<string[]> {
+  private crawl(url: string) {
     return rp(url, this.requestOptions)
       .then(
         (result: CheerioStatic) => this.onSuccess(result),
@@ -182,17 +161,38 @@ export default class Crawler {
       .catch((err: Error) => this.onError(err, url));
   }
 
-  private onSuccess(result: CheerioStatic): string[] {
+  private onSuccess(result: CheerioStatic): {
+    linkSelection: ICrawlerResult[],
+    contentSelection: ICrawlerResult[],
+  } {
     this.visitedCount += 1;
 
-    return result(this.selector)
-      .toArray()
-      .map((el: CheerioElement) => el.attribs.href);
+    const linkSelection = this.cssSelection(result, this.options.linkSelectors);
+    // @ts-ignore
+    const contentSelection = this.cssSelection(result, this.options.contentSelectors);
+
+    return { linkSelection, contentSelection };
   }
 
-  private onError(err: Error, url: string) {
+  private cssSelection(result: CheerioStatic, cssSelectors: string[]): ICrawlerResult[] {
+    return cssSelectors
+      .map((selector) => {
+        return {
+          selector,
+          elements: result(selector).toArray(),
+        };
+      });
+  }
+
+  private onError(err: Error, url: string): never {
     console.error(`Crawling webpage @ ${url} encountered an error: ${err}`);
 
     throw err;
+  }
+
+  private printDebug(msg: string): void {
+    if (this.options.debug) {
+      console.log(msg);
+    }
   }
 }
